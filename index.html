@@ -249,7 +249,7 @@ const SHEET_ID = '1Fa9uU_4VMwIE-p6YwKjDy0xaKP1RKSO5I2O0nl9WD68';
 // Google tab name -> friendly display name shown in the dashboard.
 // Add a new line here if a brand-new department tab is created.
 const DEPT_TABS = [
-  ['OT OT', 'Operation Theatre (OT)'],
+  ['OT', 'Operation Theatre (OT)'],
   ['IPC', 'Infection Prevention & Control (IPC)'],
   ['Radiology', 'Radiology'],
   ['Patient counselor', 'Patient Counselor'],
@@ -426,22 +426,7 @@ function finalizeDept(parsed){
   return {months, sections: outSections};
 }
 
-function csvUrlFor(tabName){
-  const encoded = encodeURIComponent(tabName);
-  return `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encoded}`;
-}
-
-async function fetchTabRows(tabName){
-  const url = csvUrlFor(tabName);
-  const res = await fetch(url, {cache:'no-store'});
-  if(!res.ok) throw new Error(`HTTP ${res.status}`);
-  const text = await res.text();
-  const parsed = Papa.parse(text.trim(), {skipEmptyLines:false});
-  if(parsed.errors && parsed.errors.length && (!parsed.data || !parsed.data.length)){
-    throw new Error('CSV parse failed');
-  }
-  return parsed.data.map(row => row.map(c => (c===undefined || c==='') ? null : c));
-}
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbw4CzXFJZHtg6T3RtkOH-ftaWA_NnvspkyFw9oOinWEmWSSnHvuUDc7sXuHNdcZ-qYHJA/exec';
 
 /* ============================================================
    Data load orchestration
@@ -449,16 +434,24 @@ async function fetchTabRows(tabName){
 let DATA = {};
 let loadErrors = [];
 let lastSyncTime = null;
+let ALL_TABS_CACHE = null;
 
 function sleep(ms){ return new Promise(res => setTimeout(res, ms)); }
 
-// Fetch one tab with a few retries + backoff, since Google's export endpoint
-// can transiently rate-limit bursts of concurrent requests to the same sheet.
-async function fetchTabWithRetry(tabName, attempts=3){
+// One single request to the Apps Script web app returns every tab in the
+// spreadsheet as JSON. This replaces 43 separate per-tab CSV export calls,
+// which were unreliable at this workbook size.
+async function fetchAllTabs(){
+  const res = await fetch(APPS_SCRIPT_URL, {cache:'no-store'});
+  if(!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+async function fetchAllTabsWithRetry(attempts=3){
   let lastErr;
   for(let i=0; i<attempts; i++){
     try{
-      return await fetchTabRows(tabName);
+      return await fetchAllTabs();
     } catch(err){
       lastErr = err;
       if(i < attempts-1) await sleep(400 * Math.pow(2, i) + Math.random()*200);
@@ -467,39 +460,39 @@ async function fetchTabWithRetry(tabName, attempts=3){
   throw lastErr;
 }
 
-// Process departments in small batches (not all 43 at once) so we don't
-// trip Google's per-second request limits for the same spreadsheet.
-const BATCH_SIZE = 5;
-const BATCH_GAP_MS = 300;
+// Pulls one department's rows out of the cached all-tabs JSON blob.
+function rowsForTab(tabName){
+  if(!ALL_TABS_CACHE) return null;
+  const rows = ALL_TABS_CACHE[tabName];
+  if(!rows) return null;
+  return rows.map(row => row.map(c => (c===undefined || c==='') ? null : c));
+}
 
 async function loadAllDepartments(){
   loadErrors = [];
   const newData = {};
 
-  for(let i=0; i<DEPT_TABS.length; i+=BATCH_SIZE){
-    const batch = DEPT_TABS.slice(i, i+BATCH_SIZE);
-    const results = await Promise.allSettled(batch.map(async ([tabName, display]) => {
-      const rows = await fetchTabWithRetry(tabName);
-      const hasAny = rows.some(r => r.some(hasVal));
-      if(!hasAny){
-        return [display, {months:[], sections:{Registers:{monthly:false,items:[]},KPIs:{monthly:false,items:[]},SOPs:{monthly:false,items:[]},Audits:{monthly:false,items:[]}}}];
-      }
-      const parsed = parseSheetRows(rows);
-      return [display, finalizeDept(parsed)];
-    }));
-
-    results.forEach((r, j) => {
-      const [, display] = batch[j];
-      if(r.status === 'fulfilled'){
-        newData[r.value[0]] = r.value[1];
-      } else {
-        loadErrors.push(display);
-        newData[display] = DATA[display] || {months:[], sections:{Registers:{monthly:false,items:[]},KPIs:{monthly:false,items:[]},SOPs:{monthly:false,items:[]},Audits:{monthly:false,items:[]}}, _error:true};
-      }
-    });
-
-    if(i + BATCH_SIZE < DEPT_TABS.length) await sleep(BATCH_GAP_MS);
+  try{
+    ALL_TABS_CACHE = await fetchAllTabsWithRetry();
+  } catch(err){
+    ALL_TABS_CACHE = null;
   }
+
+  DEPT_TABS.forEach(([tabName, display]) => {
+    const rows = rowsForTab(tabName);
+    const emptyDept = {months:[], sections:{Registers:{monthly:false,items:[]},KPIs:{monthly:false,items:[]},SOPs:{monthly:false,items:[]},Audits:{monthly:false,items:[]}}};
+    if(!rows){
+      loadErrors.push(display);
+      newData[display] = DATA[display] || Object.assign({}, emptyDept, {_error:true});
+      return;
+    }
+    const hasAny = rows.some(r => r.some(hasVal));
+    if(!hasAny){
+      newData[display] = emptyDept;
+      return;
+    }
+    newData[display] = finalizeDept(parseSheetRows(rows));
+  });
 
   DATA = newData;
   lastSyncTime = new Date();
@@ -639,7 +632,9 @@ function renderDept(dept){
       const entry = DEPT_TABS.find(([,disp]) => disp === dept);
       if(entry){
         try{
-          const rows = await fetchTabWithRetry(entry[0]);
+          ALL_TABS_CACHE = await fetchAllTabsWithRetry();
+          const rows = rowsForTab(entry[0]);
+          if(!rows) throw new Error('Tab not found in API response');
           const hasAny = rows.some(r => r.some(hasVal));
           DATA[dept] = hasAny ? finalizeDept(parseSheetRows(rows)) : {months:[], sections:{Registers:{monthly:false,items:[]},KPIs:{monthly:false,items:[]},SOPs:{monthly:false,items:[]},Audits:{monthly:false,items:[]}}};
           loadErrors = loadErrors.filter(x=>x!==dept);
